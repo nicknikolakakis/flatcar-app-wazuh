@@ -1,0 +1,247 @@
+variant: flatcar
+version: 1.0.0
+storage:
+  files:
+    ########################################################################
+    # Environment file (wazuh.env)
+    #
+    # Contains environment variables for the Wazuh deployment.
+    # Change passwords before deploying to production.
+    ########################################################################
+    - path: /etc/systemd/system/wazuh.env
+      mode: 0644
+      contents:
+        inline: |
+          # Wazuh indexer (OpenSearch) initial admin password.
+          # Change this before deploying to production.
+          INDEXER_PASSWORD=SecretPassword123!
+
+          # Wazuh API credentials
+          WAZUH_API_USER=wazuh-wui
+          WAZUH_API_PASSWORD=MyS3cr3tP4ssw0rd
+
+          # Wazuh indexer settings
+          INDEXER_JAVA_OPTS=-Xms512m -Xmx512m
+
+          # Docker memory limits
+          MANAGER_RAM=1G
+          INDEXER_RAM=2G
+          DASHBOARD_RAM=1G
+
+    ########################################################################
+    # Wazuh setup script
+    #
+    # Generates the required TLS certificates and configuration files
+    # on first boot using the wazuh-certs-generator image.
+    ########################################################################
+    - path: /opt/wazuh/setup.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          set -euo pipefail
+
+          WAZUH_DIR="/opt/wazuh"
+          CERTS_DIR="${WAZUH_DIR}/config/certs"
+
+          if [ -d "${CERTS_DIR}/wazuh-indexer" ]; then
+            echo "Certificates already exist, skipping generation."
+            exit 0
+          fi
+
+          echo "Generating Wazuh TLS certificates..."
+          mkdir -p "${CERTS_DIR}"
+
+          # Create certificate config
+          cat > "${WAZUH_DIR}/config/certs.yml" <<CERTSEOF
+          nodes:
+            indexer:
+              - name: wazuh-indexer
+                ip:
+                  - 127.0.0.1
+            server:
+              - name: wazuh-manager
+                ip:
+                  - 127.0.0.1
+            dashboard:
+              - name: wazuh-dashboard
+                ip:
+                  - 127.0.0.1
+          CERTSEOF
+
+          # Generate certificates
+          docker run --rm \
+            -v "${WAZUH_DIR}/config/certs.yml:/config/certs.yml:ro" \
+            -v "${CERTS_DIR}:/certificates" \
+            wazuh/wazuh-certs-generator:0.0.2
+
+          # Set permissions
+          chmod -R 500 "${CERTS_DIR}"
+          chmod -R 400 "${CERTS_DIR}"/*/*
+
+          echo "Certificates generated successfully."
+
+    ########################################################################
+    # Wazuh indexer (OpenSearch) systemd unit
+    ########################################################################
+    - path: /etc/systemd/system/wazuh-indexer.service
+      mode: 0644
+      contents:
+        inline: |
+          [Unit]
+          Description=Wazuh Indexer (OpenSearch)
+          After=docker.service wazuh-setup.service
+          Requires=docker.service wazuh-setup.service
+
+          [Service]
+          EnvironmentFile=/etc/systemd/system/wazuh.env
+          ExecStartPre=-/usr/bin/docker rm -f wazuh-indexer
+          ExecStartPre=/bin/mkdir -p /opt/wazuh/indexer-data
+          ExecStartPre=/sbin/sysctl -w vm.max_map_count=262144
+          ExecStart=/usr/bin/docker run \
+            --name wazuh-indexer \
+            --memory=${INDEXER_RAM} \
+            -p 9200:9200 \
+            -e OPENSEARCH_JAVA_OPTS=${INDEXER_JAVA_OPTS} \
+            -e OPENSEARCH_INITIAL_ADMIN_PASSWORD=${INDEXER_PASSWORD} \
+            -e bootstrap.memory_lock=true \
+            -e node.name=wazuh-indexer \
+            -e cluster.name=wazuh-cluster \
+            -e discovery.type=single-node \
+            -e plugins.security.ssl.http.enabled=true \
+            -e plugins.security.ssl.http.pemcert_filepath=/usr/share/wazuh-indexer/certs/wazuh-indexer.pem \
+            -e plugins.security.ssl.http.pemkey_filepath=/usr/share/wazuh-indexer/certs/wazuh-indexer-key.pem \
+            -e plugins.security.ssl.http.pemtrustedcas_filepath=/usr/share/wazuh-indexer/certs/root-ca.pem \
+            -e plugins.security.ssl.transport.pemcert_filepath=/usr/share/wazuh-indexer/certs/wazuh-indexer.pem \
+            -e plugins.security.ssl.transport.pemkey_filepath=/usr/share/wazuh-indexer/certs/wazuh-indexer-key.pem \
+            -e plugins.security.ssl.transport.pemtrustedcas_filepath=/usr/share/wazuh-indexer/certs/root-ca.pem \
+            -e compatibility.override_main_response_version=true \
+            -v /opt/wazuh/indexer-data:/var/lib/wazuh-indexer \
+            -v /opt/wazuh/config/certs/wazuh-indexer:/usr/share/wazuh-indexer/certs:ro \
+            -v /opt/wazuh/config/certs/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem:ro \
+            --ulimit memlock=-1:-1 \
+            --ulimit nofile=65536:65536 \
+            wazuh/wazuh-indexer:4.9.2
+          ExecStop=/usr/bin/docker stop wazuh-indexer
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    ########################################################################
+    # Wazuh manager systemd unit
+    ########################################################################
+    - path: /etc/systemd/system/wazuh-manager.service
+      mode: 0644
+      contents:
+        inline: |
+          [Unit]
+          Description=Wazuh Manager
+          After=docker.service wazuh-indexer.service
+          Requires=docker.service wazuh-indexer.service
+
+          [Service]
+          EnvironmentFile=/etc/systemd/system/wazuh.env
+          ExecStartPre=-/usr/bin/docker rm -f wazuh-manager
+          ExecStartPre=/bin/mkdir -p /opt/wazuh/manager-data /opt/wazuh/manager-etc /opt/wazuh/manager-logs
+          ExecStart=/usr/bin/docker run \
+            --name wazuh-manager \
+            --memory=${MANAGER_RAM} \
+            --link wazuh-indexer \
+            -p 1514:1514 \
+            -p 1515:1515 \
+            -p 514:514/udp \
+            -p 55000:55000 \
+            -e INDEXER_URL=https://wazuh-indexer:9200 \
+            -e INDEXER_USERNAME=admin \
+            -e INDEXER_PASSWORD=${INDEXER_PASSWORD} \
+            -e FILEBEAT_SSL_VERIFICATION_MODE=full \
+            -e SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem \
+            -e SSL_CERTIFICATE=/etc/ssl/filebeat.pem \
+            -e SSL_KEY=/etc/ssl/filebeat-key.pem \
+            -v /opt/wazuh/manager-data:/var/ossec/data \
+            -v /opt/wazuh/manager-etc:/var/ossec/etc \
+            -v /opt/wazuh/manager-logs:/var/ossec/logs \
+            -v /opt/wazuh/config/certs/wazuh-manager:/etc/ssl:ro \
+            -v /opt/wazuh/config/certs/root-ca.pem:/etc/ssl/root-ca.pem:ro \
+            wazuh/wazuh-manager:4.9.2
+          ExecStop=/usr/bin/docker stop wazuh-manager
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    ########################################################################
+    # Wazuh dashboard systemd unit
+    ########################################################################
+    - path: /etc/systemd/system/wazuh-dashboard.service
+      mode: 0644
+      contents:
+        inline: |
+          [Unit]
+          Description=Wazuh Dashboard
+          After=docker.service wazuh-indexer.service wazuh-manager.service
+          Requires=docker.service wazuh-indexer.service wazuh-manager.service
+
+          [Service]
+          EnvironmentFile=/etc/systemd/system/wazuh.env
+          ExecStartPre=-/usr/bin/docker rm -f wazuh-dashboard
+          ExecStart=/usr/bin/docker run \
+            --name wazuh-dashboard \
+            --memory=${DASHBOARD_RAM} \
+            --link wazuh-indexer \
+            --link wazuh-manager \
+            -p 443:5601 \
+            -e INDEXER_USERNAME=admin \
+            -e INDEXER_PASSWORD=${INDEXER_PASSWORD} \
+            -e WAZUH_API_URL=https://wazuh-manager \
+            -e DASHBOARD_USERNAME=kibanaserver \
+            -e DASHBOARD_PASSWORD=${INDEXER_PASSWORD} \
+            -e API_USERNAME=${WAZUH_API_USER} \
+            -e API_PASSWORD=${WAZUH_API_PASSWORD} \
+            -e SERVER_SSL_ENABLED=true \
+            -e SERVER_SSL_CERTIFICATE=/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem \
+            -e SERVER_SSL_KEY=/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem \
+            -e OPENSEARCH_HOSTS=https://wazuh-indexer:9200 \
+            -v /opt/wazuh/config/certs/wazuh-dashboard:/usr/share/wazuh-dashboard/certs:ro \
+            -v /opt/wazuh/config/certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro \
+            wazuh/wazuh-dashboard:4.9.2
+          ExecStop=/usr/bin/docker stop wazuh-dashboard
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    ########################################################################
+    # Wazuh setup oneshot unit
+    ########################################################################
+    - path: /etc/systemd/system/wazuh-setup.service
+      mode: 0644
+      contents:
+        inline: |
+          [Unit]
+          Description=Wazuh Initial Setup (certificate generation)
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/opt/wazuh/setup.sh
+
+          [Install]
+          WantedBy=multi-user.target
+
+systemd:
+  units:
+    - name: wazuh-setup.service
+      enabled: true
+    - name: wazuh-indexer.service
+      enabled: true
+    - name: wazuh-manager.service
+      enabled: true
+    - name: wazuh-dashboard.service
+      enabled: true

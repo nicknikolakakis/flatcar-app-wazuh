@@ -10,6 +10,10 @@ This repo contains a [Butane](https://coreos.github.io/butane/) configuration fo
 
 Wazuh is a free, open-source security platform that provides unified XDR and SIEM protection for endpoints and cloud workloads. It offers threat detection, integrity monitoring, incident response, and compliance capabilities.
 
+## Screenshots
+
+![Wazuh Dashboard Login](screenshots/wazuh-login.png)
+
 ## Architecture
 
 The deployment runs three containers managed by systemd:

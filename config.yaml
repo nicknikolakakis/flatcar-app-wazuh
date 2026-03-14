@@ -20,8 +20,8 @@ storage:
           WAZUH_API_USER=wazuh-wui
           WAZUH_API_PASSWORD=MyS3cr3tP4ssw0rd
 
-          # Wazuh indexer settings
-          INDEXER_JAVA_OPTS=-Xms512m -Xmx512m
+          # Wazuh indexer JVM heap (minimum 1g recommended)
+          INDEXER_JAVA_OPTS=-Xms1g -Xmx1g
 
           # Docker memory limits
           MANAGER_RAM=1G
@@ -29,12 +29,75 @@ storage:
           DASHBOARD_RAM=1G
 
     ########################################################################
+    # Custom opensearch.yml
+    #
+    # Overrides the image default to use relative cert paths (resolved
+    # from OPENSEARCH_PATH_CONF=/usr/share/wazuh-indexer) so the Java
+    # Security Manager permits reading them. Also removes
+    # cluster.initial_master_nodes which conflicts with single-node mode.
+    ########################################################################
+    - path: /opt/wazuh/config/opensearch.yml
+      mode: 0644
+      contents:
+        inline: |
+          network.host: "0.0.0.0"
+          node.name: "wazuh-indexer"
+          cluster.name: "wazuh-cluster"
+          discovery.type: single-node
+          path.data: /var/lib/wazuh-indexer
+          path.logs: /var/log/wazuh-indexer
+          plugins.security.ssl.http.pemcert_filepath: certs/indexer.pem
+          plugins.security.ssl.http.pemkey_filepath: certs/indexer-key.pem
+          plugins.security.ssl.http.pemtrustedcas_filepath: certs/root-ca.pem
+          plugins.security.ssl.transport.pemcert_filepath: certs/indexer.pem
+          plugins.security.ssl.transport.pemkey_filepath: certs/indexer-key.pem
+          plugins.security.ssl.transport.pemtrustedcas_filepath: certs/root-ca.pem
+          plugins.security.ssl.http.enabled: true
+          plugins.security.ssl.transport.enforce_hostname_verification: false
+          plugins.security.ssl.transport.resolve_hostname: false
+          plugins.security.authcz.admin_dn:
+          - "CN=admin,OU=Wazuh,O=Wazuh,L=California,C=US"
+          plugins.security.check_snapshot_restore_write_privileges: true
+          plugins.security.enable_snapshot_restore_privilege: true
+          plugins.security.nodes_dn:
+          - "CN=wazuh-indexer,OU=Wazuh,O=Wazuh,L=California,C=US"
+          plugins.security.restapi.roles_enabled:
+          - "all_access"
+          - "security_rest_api_access"
+          plugins.security.system_indices.enabled: true
+          plugins.security.system_indices.indices: [".plugins-ml-model", ".plugins-ml-task", ".opendistro-alerting-config", ".opendistro-alerting-alert*", ".opendistro-anomaly-results*", ".opendistro-anomaly-detector*", ".opendistro-anomaly-checkpoints", ".opendistro-anomaly-detection-state", ".opendistro-reports-*", ".opensearch-notifications-*", ".opensearch-notebooks", ".opensearch-observability", ".opendistro-asynchronous-search-response*", ".replication-metadata-store"]
+          compatibility.override_main_response_version: true
+
+    ########################################################################
+    # Custom opensearch_dashboards.yml
+    #
+    # Overrides the image default to point opensearch.hosts at the
+    # wazuh-indexer container (the default resolves to 127.0.0.1).
+    ########################################################################
+    - path: /opt/wazuh/config/opensearch_dashboards.yml
+      mode: 0644
+      contents:
+        inline: |
+          server.host: "0.0.0.0"
+          server.port: 443
+          opensearch.hosts: ["https://wazuh-indexer:9200"]
+          opensearch.ssl.verificationMode: certificate
+          opensearch.username: "kibanaserver"
+          opensearch.password: "kibanaserver"
+          server.ssl.enabled: true
+          server.ssl.key: "/etc/wazuh-dashboard/certs/dashboard-key.pem"
+          server.ssl.certificate: "/etc/wazuh-dashboard/certs/dashboard.pem"
+          opensearch.ssl.certificateAuthorities: ["/etc/wazuh-dashboard/certs/root-ca.pem"]
+          opensearch.requestHeadersAllowlist: ["securitytenant","Authorization"]
+          opensearch_security.multitenancy.enabled: false
+          opensearch_security.readonly_mode.roles: ["kibana_read_only"]
+
+    ########################################################################
     # Wazuh setup script
     #
-    # Generates the required TLS certificates and configuration files
-    # on first boot using the wazuh-certs-generator image.
-    # Organizes certs into per-component directories with filenames
-    # matching the defaults in each Wazuh Docker image.
+    # Generates TLS certificates on first boot, organizes them into
+    # per-component directories, and initializes the OpenSearch security
+    # index.
     ########################################################################
     - path: /opt/wazuh/setup.sh
       mode: 0755
@@ -75,33 +138,73 @@ storage:
             wazuh/wazuh-certs-generator:0.0.2
 
           # Organize certs into per-component directories with the
-          # filenames each Wazuh image expects by default.
+          # filenames each Wazuh image expects.
           mkdir -p "${CERTS_DIR}/indexer" "${CERTS_DIR}/manager" "${CERTS_DIR}/dashboard"
 
-          # Indexer expects: /etc/wazuh-indexer/certs/{indexer,indexer-key,root-ca}.pem
-          cp "${CERTS_DIR}/wazuh-indexer.pem"     "${CERTS_DIR}/indexer/indexer.pem"
-          cp "${CERTS_DIR}/wazuh-indexer-key.pem"  "${CERTS_DIR}/indexer/indexer-key.pem"
-          cp "${CERTS_DIR}/root-ca.pem"            "${CERTS_DIR}/indexer/root-ca.pem"
+          # Indexer: relative paths resolve from /usr/share/wazuh-indexer/
+          cp "${CERTS_DIR}/wazuh-indexer.pem"      "${CERTS_DIR}/indexer/indexer.pem"
+          cp "${CERTS_DIR}/wazuh-indexer-key.pem"   "${CERTS_DIR}/indexer/indexer-key.pem"
+          cp "${CERTS_DIR}/root-ca.pem"             "${CERTS_DIR}/indexer/root-ca.pem"
+          cp "${CERTS_DIR}/admin.pem"               "${CERTS_DIR}/indexer/admin.pem"
+          cp "${CERTS_DIR}/admin-key.pem"           "${CERTS_DIR}/indexer/admin-key.pem"
 
           # Manager: filebeat certs for shipping to indexer
-          cp "${CERTS_DIR}/wazuh-manager.pem"      "${CERTS_DIR}/manager/filebeat.pem"
-          cp "${CERTS_DIR}/wazuh-manager-key.pem"   "${CERTS_DIR}/manager/filebeat-key.pem"
-          cp "${CERTS_DIR}/root-ca.pem"            "${CERTS_DIR}/manager/root-ca.pem"
+          cp "${CERTS_DIR}/wazuh-manager.pem"       "${CERTS_DIR}/manager/filebeat.pem"
+          cp "${CERTS_DIR}/wazuh-manager-key.pem"    "${CERTS_DIR}/manager/filebeat-key.pem"
+          cp "${CERTS_DIR}/root-ca.pem"             "${CERTS_DIR}/manager/root-ca.pem"
 
-          # Dashboard expects: /etc/wazuh-dashboard/certs/{dashboard,dashboard-key,root-ca}.pem
-          cp "${CERTS_DIR}/wazuh-dashboard.pem"     "${CERTS_DIR}/dashboard/dashboard.pem"
-          cp "${CERTS_DIR}/wazuh-dashboard-key.pem"  "${CERTS_DIR}/dashboard/dashboard-key.pem"
-          cp "${CERTS_DIR}/root-ca.pem"             "${CERTS_DIR}/dashboard/root-ca.pem"
+          # Dashboard: /etc/wazuh-dashboard/certs/
+          cp "${CERTS_DIR}/wazuh-dashboard.pem"      "${CERTS_DIR}/dashboard/dashboard.pem"
+          cp "${CERTS_DIR}/wazuh-dashboard-key.pem"   "${CERTS_DIR}/dashboard/dashboard-key.pem"
+          cp "${CERTS_DIR}/root-ca.pem"              "${CERTS_DIR}/dashboard/root-ca.pem"
 
           # Indexer runs as UID 1000 — certs must be readable
+          chown -R 1000:1000 "${CERTS_DIR}/indexer"
           chmod 644 "${CERTS_DIR}/indexer/"* "${CERTS_DIR}/manager/"* "${CERTS_DIR}/dashboard/"*
 
           echo "Certificates generated successfully."
 
     ########################################################################
+    # Security initialization script
+    #
+    # Initializes the OpenSearch security index after the indexer starts.
+    # Runs once and waits for the indexer to be ready before proceeding.
+    ########################################################################
+    - path: /opt/wazuh/init-security.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "Waiting for Wazuh indexer to start..."
+          for i in $(seq 1 60); do
+            if docker exec wazuh-indexer bash -c "curl -sk https://localhost:9200 2>/dev/null | grep -q 'not initialized'" 2>/dev/null; then
+              echo "Indexer is up, initializing security..."
+              docker exec wazuh-indexer bash -c "
+                export JAVA_HOME=/usr/share/wazuh-indexer/jdk
+                bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh \
+                  -cd /usr/share/wazuh-indexer/opensearch-security/ \
+                  -nhnv \
+                  -cacert /usr/share/wazuh-indexer/certs/root-ca.pem \
+                  -cert /usr/share/wazuh-indexer/certs/admin.pem \
+                  -key /usr/share/wazuh-indexer/certs/admin-key.pem \
+                  -h localhost
+              "
+              echo "Security initialized successfully."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: Timed out waiting for indexer"
+          exit 1
+
+    ########################################################################
     # Wazuh indexer (OpenSearch) systemd unit
     #
-    # Uses the image's default cert paths at /etc/wazuh-indexer/certs/.
+    # Mounts certs to /usr/share/wazuh-indexer/certs/ (relative paths
+    # in opensearch.yml resolve here, within the Java Security Manager's
+    # allowed classpath).
     ########################################################################
     - path: /etc/systemd/system/wazuh-indexer.service
       mode: 0644
@@ -124,18 +227,35 @@ storage:
             -e OPENSEARCH_JAVA_OPTS=${INDEXER_JAVA_OPTS} \
             -e OPENSEARCH_INITIAL_ADMIN_PASSWORD=${INDEXER_PASSWORD} \
             -e bootstrap.memory_lock=true \
-            -e node.name=wazuh-indexer \
-            -e cluster.name=wazuh-cluster \
-            -e discovery.type=single-node \
-            -e compatibility.override_main_response_version=true \
             -v /opt/wazuh/indexer-data:/var/lib/wazuh-indexer \
-            -v /opt/wazuh/config/certs/indexer:/etc/wazuh-indexer/certs:ro \
+            -v /opt/wazuh/config/certs/indexer:/usr/share/wazuh-indexer/certs \
+            -v /opt/wazuh/config/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro \
             --ulimit memlock=-1:-1 \
             --ulimit nofile=65536:65536 \
             wazuh/wazuh-indexer:4.9.2
           ExecStop=/usr/bin/docker stop wazuh-indexer
           Restart=always
           RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    ########################################################################
+    # Security initialization oneshot unit
+    ########################################################################
+    - path: /etc/systemd/system/wazuh-security-init.service
+      mode: 0644
+      contents:
+        inline: |
+          [Unit]
+          Description=Initialize Wazuh Indexer Security
+          After=wazuh-indexer.service
+          Requires=wazuh-indexer.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/opt/wazuh/init-security.sh
 
           [Install]
           WantedBy=multi-user.target
@@ -149,8 +269,8 @@ storage:
         inline: |
           [Unit]
           Description=Wazuh Manager
-          After=docker.service wazuh-indexer.service
-          Requires=docker.service wazuh-indexer.service
+          After=docker.service wazuh-security-init.service
+          Requires=docker.service wazuh-security-init.service
 
           [Service]
           EnvironmentFile=/etc/systemd/system/wazuh.env
@@ -186,7 +306,8 @@ storage:
     ########################################################################
     # Wazuh dashboard systemd unit
     #
-    # Uses the image's default cert paths at /etc/wazuh-dashboard/certs/.
+    # Mounts a custom opensearch_dashboards.yml that points to the
+    # indexer container instead of localhost.
     ########################################################################
     - path: /etc/systemd/system/wazuh-dashboard.service
       mode: 0644
@@ -194,8 +315,8 @@ storage:
         inline: |
           [Unit]
           Description=Wazuh Dashboard
-          After=docker.service wazuh-indexer.service wazuh-manager.service
-          Requires=docker.service wazuh-indexer.service wazuh-manager.service
+          After=docker.service wazuh-security-init.service wazuh-manager.service
+          Requires=docker.service wazuh-security-init.service wazuh-manager.service
 
           [Service]
           EnvironmentFile=/etc/systemd/system/wazuh.env
@@ -206,15 +327,11 @@ storage:
             --link wazuh-indexer \
             --link wazuh-manager \
             -p 443:443 \
-            -e INDEXER_USERNAME=admin \
-            -e INDEXER_PASSWORD=${INDEXER_PASSWORD} \
             -e WAZUH_API_URL=https://wazuh-manager \
-            -e DASHBOARD_USERNAME=kibanaserver \
-            -e DASHBOARD_PASSWORD=${INDEXER_PASSWORD} \
             -e API_USERNAME=${WAZUH_API_USER} \
             -e API_PASSWORD=${WAZUH_API_PASSWORD} \
-            -e OPENSEARCH_HOSTS=https://wazuh-indexer:9200 \
             -v /opt/wazuh/config/certs/dashboard:/etc/wazuh-dashboard/certs:ro \
+            -v /opt/wazuh/config/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro \
             wazuh/wazuh-dashboard:4.9.2
           ExecStop=/usr/bin/docker stop wazuh-dashboard
           Restart=always
@@ -248,6 +365,8 @@ systemd:
     - name: wazuh-setup.service
       enabled: true
     - name: wazuh-indexer.service
+      enabled: true
+    - name: wazuh-security-init.service
       enabled: true
     - name: wazuh-manager.service
       enabled: true
